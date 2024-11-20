@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
 
-sys.path.append(os.path.abspath("/home/frc-ag-2/Downloads/sam2"))
+sys.path.append(os.path.abspath("/home/frc-ag-2/Downloads/sam2")) ### CHANGE DEPENDING ON LOCAL LOCATION
 
 from torchvision import transforms
 from torchvision.models.detection import maskrcnn_resnet50_fpn, MaskRCNN_ResNet50_FPN_Weights
@@ -15,64 +15,84 @@ from matplotlib.patches import Rectangle
 import time
 
 
-class Tester():
+class SAMDynamicReader():
 	def __init__(self):
-		# Initialize the node
+		"""
+		SAMFrameReader Functionalities:
+		- get_frame is an early build, meant to call the relevant frame for segmentation
+		- coco_mask uses a pre-trained Mask RCNN to find "dynamic-likely" objects and creates masks for SAM initialization
+		- initialize_first_frame initializes the SAM2 Predictor and inputs the relevant object masks
+		- mask_step takes the encoded masks and transfers them to a new frame
+		- update_csv_file packages mask_step and init_first_frame together to continually read and write a csv with whether a pixel location is in a mask
+		"""
 		super().__init__()
 
-		torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-		self.coredir = "/home/frc-ag-2/Downloads/sam2"
-
-
+		## initialize directories, device, and relevant class information
+		# torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+		self.coredir = "/home/frc-ag-2/Downloads/sam2"   ### CHANGE DEPENDING ON LOCAL LOCATION
 
 		self.model = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.COCO_V1)
 		self.model.eval()  # Set to evaluation mode
 
-		self.device = torch.device("cuda")
+		self.device = torch.device("cpu")
 
 		self.sam2_checkpoint = self.coredir + "/checkpoints/sam2.1_hiera_small.pt"
 		self.model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
-		self.predictor = None
+		self.predictor = build_sam2_video_predictor(self.model_cfg, self.sam2_checkpoint, device=self.device)
 		self.inference_state = None
-		self.video_dir = self.coredir + "/notebooks/videos/bedroomtest"
+		self.video_dir = self.coredir + "/notebooks/videos/bedroomtest"   # where a single frame goes for future frame prediction
 		if not os.path.exists(self.video_dir):
 			os.mkdir(self.video_dir)
 
-		self.frame_dir = self.coredir + "/notebooks/videos/bedroom"
-		self.update_csv = self.coredir+"/communication.csv"
+		### This block is structures for demo, definitely can be optimized
+		self.frame_dir = self.coredir + "/notebooks/videos/bedroom"       # separated directory with all frames
+		self.update_csv = self.coredir+"/communication.csv"               # communication csv
 		with open(self.update_csv, 'w') as file:
 			writer = csv.writer(file)
-			writer.writerow([300,300,0])
+			writer.writerow([300,300,200,100,0])
 
-		with open(self.coredir + "/coco-labels-paper.txt", 'r') as file:
+		with open(self.coredir + "/coco-labels-paper.txt", 'r') as file:   ### REMEMBER TO COPY TXT INTO SAM2 DIR
 			# Read all lines and strip newlines, then store each line as an element in a list
 			lines = file.readlines()
 
 		# Strip newline characters and store each line as a string in a list
 		self.class_names = [line.strip() for line in lines]
 
-		self.frame_stride = 5
+		self.frame_stride = 5      ### increase for closer to real-time
 		self.init = -1
 
 	def update_csv_file(self):
+		'''
+		Purpose: Communication loop over csv file, writing whether a pixel loc. is in a dynamic object mask
+		Application: Need another script writing to the csv. This scripts takes comma separated arguments and writes a boolean response
+		Arguments: (In the csv) They should be organize x1, y1, x2, y2, ..., xn, yn, frame_idx
+			- frame_idx is the number of the frame in the video seq.
+		Returns: (In the csv) Sequence of booleans corresponding to each pair of pixel coor. provided
+
+		Example: If 300,300,10,10,15 is found in the csv, then 1, 0 might be returned
+		:return:
+		'''
 		### While loop checking until csv has 3 inputs
 		update_ready = False
-		startTime = time.time()
+		old_result = []
+		startTime = time.time()   ### timing variable
 		with torch.no_grad():
 			while True:
+				## check whether anything new has been written
 				with open(self.update_csv, 'r') as file:
 					csv_reader = csv.reader(file)
 					status = list(csv_reader)[0]
-					if len(status) > 1:
+					if len(status) > 1 and status != [str(res) for res in old_result]:
 						update_ready = True
 
 				if update_ready:
+					## choose whether to re-initialize or step
 					frame_idx = int(status[-1])
 					frame = self.get_frame(frame_idx)
 					if (frame_idx - self.init) >= self.frame_stride or self.init == -1:
 						mask_combined = self.initialize_from_frame(frame)
 						self.init = frame_idx
-						print(time.time() - startTime)
+						print(time.time() - startTime)  ### output cycle time
 						startTime = time.time()
 					else:
 						mask_combined = self.mask_step(frame, frame_idx-self.init)
@@ -80,6 +100,7 @@ class Tester():
 					mask_combined /= 255
 					mask_combined = mask_combined[:, :, 0]
 
+					## write mask results to csv
 					result = []
 					for i in range((len(status)-1)//2):
 						result.append(mask_combined[int(status[2*i]), int(status[2*i+1])])
@@ -87,7 +108,9 @@ class Tester():
 						writer = csv.writer(file)
 						writer.writerow(result)
 					print(result)
+					old_result = result[:]
 
+					# Comment out if you want to stop continual "fake communication"
 					with open(self.update_csv, 'w') as file:
 						writer = csv.writer(file)
 						status[-1] = int(status[-1]) + 1
@@ -96,13 +119,16 @@ class Tester():
 
 	def get_frame(self, frame_idx):
 		"""
-        needs to be re-written to allow for pulling from a video
+        Temporary ~ if possible, could be updated to read a mp4 file or soemething more real-time esque
         """
 		filename = self.frame_dir +"/"+ f"{frame_idx:05d}.jpg"
 		frame = Image.open(filename).convert("RGB")
 		return frame
 
 	def get_dynamic_segmentation(self, image):
+		"""
+		Core COCO Application ~ applies pre-trained model on input, finds which masks are high scoring and "dynamic", and adds them to a mask list
+		"""
 		masks = []
 		# Run inference on the image
 		with torch.no_grad():
@@ -130,6 +156,9 @@ class Tester():
 			img_mean=(0.485, 0.456, 0.406),
 			img_std=(0.229, 0.224, 0.225),
 	):
+		"""
+		For preparing a frame matrix to the mask_step pipeline
+		"""
 		if isinstance(img, np.ndarray):
 			img_np = img
 			img_np = cv2.resize(img_np, (image_size, image_size)) / 255.0
@@ -148,6 +177,9 @@ class Tester():
 		return img, width, height
 
 	def coco_mask(self, im):
+		"""
+		Input an image and receive a list of masks that belong to high scoring dynamic objects
+		"""
 		# Load the input image
 		# im = Image.open(image_path).convert("RGB")
 		im = Image.fromarray(np.uint8(im))
@@ -159,6 +191,9 @@ class Tester():
 		return masks_
 
 	def _get_feature(self, img, batch_size):
+		"""
+		Feature calling for mask_step function
+		"""
 		if self.device == torch.device("cuda"):
 			image = img.cuda().float().unsqueeze(0)
 		else:
@@ -202,9 +237,11 @@ class Tester():
 		return any_res_masks, video_res_masks
 
 	def initialize_from_frame(self, frame):
-		# Load the pre-trained Mask R-CNN model
-		self.predictor = build_sam2_video_predictor(self.model_cfg, self.sam2_checkpoint, device=self.device)
-
+		"""
+		Core initialization every few frames for storing an image + mask inside the predictor's inference state
+		Used for transfering this masks into the other frames
+		Outputs a combined mask for the initializing frame ~ comes straight from the COCO model output
+		"""
 		## Create Subvideo
 		frame.save(self.video_dir + "/00000.jpg")
 
@@ -239,6 +276,10 @@ class Tester():
 		return mask_combined
 
 	def mask_step(self, frame, i):
+		"""
+		With an initialized inference state in the class, the mask_step takes the encoded mask / image and takes "a step" to the next frame
+		This takes in a frame (and a semi-arbitrary iteration #) and outputs a combined mask of dynamic objects
+		"""
 		im = Image.fromarray(np.uint8(frame)).convert("RGB")
 		img, _, _ = self.prepare_data(im)
 		output_dict = self.inference_state["output_dict"]
@@ -278,8 +319,11 @@ class Tester():
 		return mask_combined
 
 if __name__ == '__main__':
-	sam = Tester()
+	### This is the core code for getting this node started. Run this file to get the continual csv communication started
+	sam = SAMDynamicReader()
 	sam.update_csv_file()
+
+	### This is old test scripts, keep for personal documentation
 	# frame = Image.open(sam.coredir + "/notebooks/videos/bedroom/0000" + str(0) + ".jpg").convert("RGB")
 	# mask_combined = sam.initialize_from_frame(frame)
 	# print(mask_combined[300, 300])
